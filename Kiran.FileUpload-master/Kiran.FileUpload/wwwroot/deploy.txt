@@ -1,0 +1,712 @@
+Param(
+  [Parameter(Mandatory = $false)] [string]$tenantid,
+  [Parameter(Mandatory = $false)] [string]$subscriptionId ,
+  [Parameter(Mandatory = $false)] [string]$SubscriptionName,
+  [Parameter(Mandatory = $false)] [switch]$NoAzureLogin,
+  [Parameter(Mandatory = $false)] [switch]$NoProxy,
+  [Parameter(Mandatory = $False)] [string]$ProxyhostURI,
+  [Parameter(Mandatory = $False)] [string]$AZURE_SERVICE_PRINCIPAL,
+  [Parameter(Mandatory = $False)] [string]$AZURE_SERVICE_PRINCIPAL_SECRET,
+  [Parameter(Mandatory = $False)] [string]$PROXY_USERNAME,
+  [Parameter(Mandatory = $False)] [string]$PROXY_USERNAME_SECRET,
+  [Parameter(Mandatory = $False)] [string]$DeployKeyVaultName,
+  [Parameter(Mandatory = $False)] [string]$SPNKeyVaultName,
+  [Parameter(Mandatory = $false)] [string]$SPNKeyVaultSubscriptionName,
+  [Parameter(Mandatory = $False)] [string]$SPNKeyVaultSecretName,
+  [Parameter(Mandatory = $False)] [string]$ModulePath = ".\PSModules",
+  [Parameter(Mandatory = $false)] [string]$KeyVaultName, # Backwards Compatibility, should use DeployKeyVaultName instead.
+  [Parameter(Mandatory = $false)] [string]$ChefServer,
+  [Parameter(Mandatory = $false)] [string]$ChefOrganization,
+  [Parameter(Mandatory = $false)] [string]$JsonDirectory = ".\parameters",
+  [Parameter(Mandatory = $false)] [switch]$RunDelete,
+  [Parameter(Mandatory = $False)] [string]$KnifeDirectory = ".\.chef",
+  [Parameter(Mandatory = $False)] [string]$JsonAttributeFileName = "fl_base_linux_corp.json",
+  [Parameter(Mandatory = $False)] [string]$JsonAttributeSecretNameModifier = "json-attributes-file",
+  [Parameter(Mandatory = $False)] [string]$EncryptedDataBagFileName = "encrypted_data_bag_secret.pem",
+  [Parameter(Mandatory = $False)] [string]$EncryptedDataBagSecretNameModifier = "encrypted-data-bag",
+  [Parameter(Mandatory = $False)] [string]$KnifeRbFileName = "knife.rb",
+  [Parameter(Mandatory = $False)] [string]$KnifeRbSecretNameModifier = "knife-rb",
+  [Parameter(Mandatory = $False)] [string]$OrgValidatorFileName = "fl-validator.pem",
+  [Parameter(Mandatory = $False)] [string]$OrgValidatorSecretNameModifier = "validator-pem",
+  [Parameter(Mandatory = $False)] [string]$UserCertFileName = "bambooagent.pem",
+  [Parameter(Mandatory = $False)] [string]$UserCertSecretNameModifier = "user-pem",
+  [Parameter(Mandatory = $False)] [string]$BootStrapUserSecretName = "iaas-vm-default-user-name",
+  [Parameter(Mandatory = $False)] [string]$BootStrapUserPasswordSecretName = "iaas-vm-default-user-password",
+  [Parameter(Mandatory = $false)]
+  [switch]$EnableDebugContinue,
+  [Parameter(Mandatory = $false)]
+  [string]$JsonPSVariableFile = ".\chef.deployment.template.json"
+)
+if ( $EnableDebugContinue ) { $DebugPreference = 'Continue' }
+########
+## Import Modules ##
+########
+If ( ! (Get-module FLAzureDeployHelper )) {
+  try { Import-Module $ModulePath\FLAzureDeployHelper\FLAzureDeployHelper.psm1 -ErrorAction Stop }
+  catch {
+    throw "Can not import module $ModulePath\FLAzureDeployHelper\FLAzureDeployHelper.psm1"
+    exit 1
+  }
+}
+If ( ! (Get-module FLChefDeployHelper )) {
+  try { Import-Module $ModulePath\FLChefDeployHelper\FLChefDeployHelper.psm1 -ErrorAction Stop }
+  catch {
+    throw "Can not import module $ModulePath\FLChefDeployHelper\FLChefDeployHelper.psm1"
+    exit 1
+  }
+}
+
+####### Standard Script Boilerplate #######
+#The Directory the script is in.
+$ScriptDir = Split-Path ($MyInvocation.MyCommand.Path) -Parent
+#The filename of the script.
+$ScriptName = $MyInvocation.MyCommand.Name
+$ScriptStartTime = Get-Date
+
+####### Script Variables #######
+$ScriptVersion = 2.0.0
+$BaseDir = "$ScriptDir"
+
+####### Declare Functions #######
+Function Timestamp {
+  Param ()
+  get-date -uformat "%H:%M:%S"
+}
+
+Function MarkScriptEnd {
+  Param ()
+  $ScriptEndTime = Get-Date
+  $Time = $ScriptEndTime - $ScriptStartTime
+  $TimeMinutes = $Time.Minutes
+  $TimeSeconds = $Time.Seconds
+  Write-Host -ForegroundColor Yellow "`t* * Script $ScriptName completed in $TimeMinutes minutes and $TimeSeconds seconds. *"
+}
+
+Function ScriptEndError {
+  Param ($Name, $ExitCode, $ErrorMessage)
+  Write-Error "`t**"
+  Write-Error "`t*$(timestamp) Error code $($ExitCode): Chef Actions on $Name failed with the following error message:"
+  Write-Error "`t** $ErrorMessage"
+  MarkScriptEnd
+  throw "Chef Actions Script Failed"
+  Exit $ExitCode # Script should not reach this line
+}
+
+Function RunDelete {
+  Param ($Name, $NodeIP, $SSHUserPassword, $SSHUser)
+  if ($server.chefbootstrap) {
+    Write-Host -ForegroundColor Yellow "`t* $(timestamp) An error has occurred.  Cleaning up Chef Artifacts of $Name"
+    Remove-ChefNode -NodeName $NodeName  -NodeIP $NodeIP -NodeAdministratorPassword $SSHUserPassword -NodeAdministrator $SSHUser
+  }
+  if ($RunDelete) {
+    Write-Host -ForegroundColor Yellow "`t* $(timestamp) Delete Run of $Name complete"
+  }
+}
+
+Function CleanupFailure {
+  Param ($Name, $NodeIP, $SSHUserPassword, $SSHUSer, $ExitCode, $ErrorMessage)
+  if ($server.chefbootstrap) {
+    Write-Host -ForegroundColor Yellow "`t* $(timestamp) An error has occurred.  Cleaning up Chef Artifacts of $Name"
+    Remove-ChefNode -NodeName $NodeName  -NodeIP $NodeIP -NodeAdministratorPassword $SSHUserPassword -NodeAdministrator $SSHUser
+  }
+  if ($RunDelete) {
+    Write-Host -ForegroundColor Yellow "`t* $(timestamp) Cleanup Run of $Name complete"
+    MarkScriptEnd
+    exit 0
+  }
+  else {
+    ScriptEndError -Name $Name -ExitCode $ExitCode -ErrorMessage "$ErrorMessage"
+  }
+}
+
+function Get-ProxyCreds {
+  $cred = Get-StoredCredential -Target "httpproxy"
+  if ($cred -eq $null ) {
+    Write-Host -ForegroundColor Red "`t* $(timestamp) Error Code 6: httpproxy credentials do not exist.  Terminating with error code 6"
+    $ExitCode = 6
+    $ErrorMessage = "$(timestamp) Error Code 6: httpproxy credentials do not exist.  Terminating with error code 6"
+    ScriptEndError -Name $Name -ExitCode $ExitCode -ErrorMessage "$ErrorMessage"
+  }
+  else {
+    $username = $cred.UserName
+    $ptr = [System.Runtime.InteropServices.Marshal]::SecureStringToGlobalAllocUnicode($cred.Password)
+    $password = [System.Runtime.InteropServices.Marshal]::PtrToStringUni($ptr)
+    [System.Runtime.InteropServices.Marshal]::ZeroFreeGlobalAllocUnicode($ptr)
+    Write-Host -ForegroundColor Green "`t* $(timestamp) Stored credentials for http proxy acquired"
+  }
+  #This really will only work if the hostname starts with the site loc, aka mlw, chw, via, azu AND
+  #The site proxy is $SiteLocpxy01.corp.footlocker.net, which for most sites is true :)
+  $SiteLoc = ($server.name).Substring(0, 3)
+  Set-Variable -Name bootstrapHttpProxy -Value "`"http://${username}:${password}@$SiteLoc`pxy01.corp.footlocker.net:8080`"" -Scope Global
+  Set-Variable -Name bootstrapHttpsProxy -Value "`"https://${username}:${password}@$SiteLoc`pxy01.corp.footlocker.net:8080`"" -Scope Global
+  Set-Variable -Name bootstrapNoProxy -Value "`'localhost,127.0.0.1,.corp.footlocker.net,.footlocker.net,mlwtec08,mlwchf99,mlwchf01`'"  -Scope Global
+  Write-Host -ForegroundColor Green "`t* $(timestamp) Set http proxy using default values"
+}
+
+function Get-WindowsCreds {
+  $cred = Get-StoredCredential -Target "winrmbootstrap"
+  if ($cred -eq $null ) {
+    Write-Host -ForegroundColor Red "`t* $(timestamp) Error Code 7: winrmbootstrap credentials do not exist.  Terminating with error code 7"
+    $ExitCode = 7
+    $ErrorMessage = "$(timestamp) Error Code 7: winrmbootstrap credentials do not exist.  Terminating with error code 7"
+    ScriptEndError -Name $Name -ExitCode $ExitCode -ErrorMessage "$ErrorMessage"
+  }
+  else {
+    $winrmusername = $cred.UserName
+    $ptr = [System.Runtime.InteropServices.Marshal]::SecureStringToGlobalAllocUnicode($cred.Password)
+    $winrmpassword = [System.Runtime.InteropServices.Marshal]::PtrToStringUni($ptr)
+    [System.Runtime.InteropServices.Marshal]::ZeroFreeGlobalAllocUnicode($ptr)
+    Write-Host -ForegroundColor Green "`t* $(timestamp) Acquired winrm stored user credentials"
+$returnedCreds = @($winrmusername, $winrmpassword)
+Return $returnedCreds
+  }
+}
+
+# Even playing with Scopes, this just would not work when it is IN a module, and the variable was/is created in the script.
+# It's fine if the variable didn't already exist .. bleh... Something to look into later.
+function Set-JsonFileToPSVariable {
+  <#
+.SYNOPSIS
+  Create PowerShell Variables with the names and variable values from a json file
+.DESCRIPTION
+  Set-JsonFileToPSVariable will parse a json file for key/value pairs at the top level.
+  It does not support nested json, it will create a variable using the key value as the name
+  And set the value of the variable to the json value. It will also interpolate the JSON value
+  allowing for the use of PowerShell commands and Variables. Becareful using this as the escaping
+  mechanisms might not match native powershell usage.
+.PARAMETER JsonFile
+  The full path (including filename) of the Json file to parse
+.PARAMETER Scope
+  The Variable Scope to set. Default is Script. Valid values are global, Local and Script
+.EXAMPLE
+  Set-JsonFileToPSVariable -JsonFile myfile.json
+.EXAMPLE
+  Set-JsonFileToPSVariable -JsonFile myfile.json -Scope Local
+.LINK
+.FUNCTIONALITY
+#>
+[CmdletBinding()]
+  param(
+    [Parameter(Mandatory = $true)]
+    [string] $JsonFile,
+    # Use Script if you just want the variable available within the script
+    [Parameter(Mandatory = $false)]
+    [ValidateSet('global', 'Local', 'Script')]
+    [string]
+    $Scope = 'Script'
+  )
+  If (Test-Path $JsonFile) {
+    $EnvVars = Get-Content $JsonFile | ConvertFrom-Json
+  }
+  else {
+    Write-Host -ForegroundColor Red "`t* $_"
+    Write-Host -ForegroundColor Red "`t* Error: JSON file not found at $JsonFile."
+    throw "Error: JSON file not found"
+  }
+  foreach ($key in Get-JsonObjectKeys $EnvVars) {
+    $valuetemp = $EnvVars.$key
+    if ($key -match "ResourceGroupTag") {
+      Write-Verbose "Key Matches ResourceGroupTag"
+      # Need a better way to determine that we need to convert to hashtable ..
+      $value = (ConvertFrom-PSCustomObjectToHashtable -Object $EnvVars.$key)
+    } elseif ($valuetemp -match "\$") {
+      write-verbose "Match $ in $valuetemp"
+    # This will allow you to use PowerShell Syntax without escaping in the "value"
+    # of the json.  However I believe either this method isn't the most secure
+    # or even supporting the concept is the smartest choice as it could be abused
+    # quite easily to run code as the process that is reading in the json..
+    # I also don't have a better idea at this time.
+      $value = $ExecutionContext.InvokeCommand.ExpandString($valuetemp)
+    } else {
+      write-verbose "match nothing in $valuetemp, assuming it's just a string"
+      # Probably just a string
+      $value = $valuetemp
+    }
+    # On the Bizarro chance someone decides to include an empty value to a key..
+    if ($value) {
+      Write-Verbose "Set PowerShell Variable: $Key to $value"
+      Set-Variable -Name $key -Value $($value) -Scope $Scope -Force
+    }
+    else {
+      Write-Verbose "No Value: $value for Key: $key"
+    }
+  }
+}
+
+
+####### Begin Script #######
+Write-Host -ForegroundColor Yellow "`t* *****************"
+Write-Host -ForegroundColor Yellow "`t* $(timestamp) Script $ScriptName v$ScriptVersion run on $(Get-Date -format d)"
+Write-Host -ForegroundColor Yellow "`t******************"
+Write-Host -ForegroundColor Yellow "`t* Script $ScriptName v$ScriptVersion run on $(Get-Date -format d)"
+#Ensure that the deployment script is running in the correct directory.
+Set-Location $MyInvocation.MyCommand.Path -ErrorAction SilentlyContinue
+
+# Read in any deployment json file ..
+If (Test-Path $JsonPSVariableFile) {
+  Write-verbose "Json PS Variable File found at $JsonPSVariableFile"
+  Set-JsonFileToPSVariable -JsonFile $JsonPSVariableFile
+} else {
+  Write-verbose "No JSON PS Variable file found at $JsonPSVariableFile"
+}
+
+if ( $EnableDebugContinue ) { $DebugPreference = 'Continue' }
+
+####### Validation Checks #######
+If ( -Not ( Test-Path $JsonDirectory))	{
+  Write-Host -ForegroundColor Red "`t* $(timestamp) Error Code $RC`: Can not find JsonDirectory - $JsonDirectory "
+  $ExitCode = 1
+  $ErrorMessage = "$(timestamp) Error Code $RC`: Can not find JsonDirectory - $JsonDirectory "
+  ScriptEndError -Name $Name -ExitCode $ExitCode -ErrorMessage "$ErrorMessage"
+}
+
+# Validate Parameterfiles that are valid JSON files.
+Confirm-ValidJson -jsonPath $JsonDirectory | Out-Null
+
+# Log in to Azure
+#Confirm Connection to Azure, optionally setup proxy or login to Azure.
+Set-AzureLogin -PROXY_USERNAME $PROXY_USERNAME -PROXY_USERNAME_SECRET $PROXY_USERNAME_SECRET `
+  -ProxyHostURI $ProxyHostURI -tenantid $tenantid -AZURE_SERVICE_PRINCIPAL $AZURE_SERVICE_PRINCIPAL `
+  -AZURE_SERVICE_PRINCIPAL_SECRET $AZURE_SERVICE_PRINCIPAL_SECRET -NoProxy:$NoProxy.IsPresent `
+  -UseStoredProxyCreds:$UseStoredProxyCreds.IsPresent -UseStoredAzureCreds:$UseStoredAzureCreds.IsPresent `
+  -NoAzureLogin:$NoAzureLogin.IsPresent
+
+# If we don't pass SPNKeyVaultName then we are doing it "old style"
+if ( $SPNKeyVaultName ) {
+  #Locate the correct subscription
+  if ( -not $SPNKeyVaultSubscriptionName ) { $SPNKeyVaultSubscriptionName = $subscriptionName }
+  Confirm-Subscription -subscriptionName $SPNKeyVaultSubscriptionName -subscriptionID $subscriptionID
+
+  # Get our Deployment SPN
+  # Some of our SPN Service Names use underscores (_), but the Keyvault Secret Name can't .. So conver any _ to -
+  $SPNKeyVaultSecretName = ($SPNKeyVaultSecretName).Replace("_", "-")
+  $DeploymentCredentials = Get-PSCredentialFromKeyVaultSecrets -KeyVaultName $SPNKeyVaultName -UserSecretName "$SPNKeyVaultSecretName-APPID" -PasswordSecretName "$SPNKeyVaultSecretName-PASSWD"
+  if ($DeploymentCredentials -eq $null ) {
+    Write-Host -ForegroundColor Red "`t* StoredCredentials for Deployment ID $SPNKeyVaultSecretName do not exist in Keyvault $SPNKeyVaultName"
+    throw "Error retrieving credentials from Key Vault"
+    exit 10
+  }
+  else {
+    Write-Host -ForegroundColor Yellow "`t* Using Keyvault Credentials for Azure Deployment"
+  }
+
+  # Okay, Now logout of Azure (We are currently connected using the Creds that can access the KV)
+  Write-Host -ForegroundColor Yellow "`tLogging Out...";
+  Disconnect-AzureRmAccount
+  
+  if ( $EnableDebugContinue ) { $DebugPreference = 'Continue' }
+  # sign in
+  Write-Host -ForegroundColor Yellow "`tLogging in... Using Deployment Credentials";
+  # Confirm Connection to Azure, optionally setup proxy or login to Azure.
+  Set-AzureLogin -PROXY_USERNAME $PROXY_USERNAME -PROXY_USERNAME_SECRET $PROXY_USERNAME_SECRET `
+    -ProxyHostURI $ProxyHostURI -tenantid $tenantid -NoProxy:$NoProxy.IsPresent `
+    -Credential $DeploymentCredentials
+
+  # Locate the correct subscription
+  Confirm-Subscription -subscriptionName $subscriptionName -subscriptionID $subscriptionID
+}
+else {
+  #Locate the correct subscription
+  Confirm-Subscription -subscriptionName $subscriptionName -subscriptionID $subscriptionID
+}
+
+####### Main #######
+# For now just assume we are all using the "same" Chef Server and Chef Organization for all nodes
+if ( -not $DeployKeyVaultName ) { $DeployKeyVaultName = $KeyVaultName }
+# Restore the Encrypted Data Bag Secret
+Restore-FileFromKeyVaultSecret -KeyVaultName $DeployKeyVaultName  -KeyVaultSecretName "$ChefServer-$ChefOrganization-$EncryptedDataBagSecretNameModifier" -RestoredFileDirectory $KnifeDirectory -RestoredFileName $EncryptedDataBagFileName
+# Restore the Json Atrribute file
+Restore-FileFromKeyVaultSecret -KeyVaultName $DeployKeyVaultName  -KeyVaultSecretName "$ChefServer-$ChefOrganization-$JsonAttributeSecretNameModifier" -RestoredFileDirectory $KnifeDirectory -RestoredFileName $JsonAttributeFileName
+# Restore the knife.rb File
+Restore-FileFromKeyVaultSecret -KeyVaultName $DeployKeyVaultName  -KeyVaultSecretName "$ChefServer-$ChefOrganization-$KnifeRbSecretNameModifier" -RestoredFileDirectory $KnifeDirectory -RestoredFileName $KnifeRbFileName
+# Restore the use pem file
+Restore-FileFromKeyVaultSecret -KeyVaultName $DeployKeyVaultName  -KeyVaultSecretName "$ChefServer-$ChefOrganization-$UserCertSecretNameModifier" -RestoredFileDirectory $KnifeDirectory -RestoredFileName $UserCertFileName
+# Restore the Organization Validator Pem file
+Restore-FileFromKeyVaultSecret -KeyVaultName $DeployKeyVaultName  -KeyVaultSecretName "$ChefServer-$ChefOrganization-$OrgValidatorSecretNameModifier" -RestoredFileDirectory $KnifeDirectory -RestoredFileName $OrgValidatorFileName
+# And now restore the CA Certs (Because we need those too), it would be nice if there was a way to just download them via powershell from AD ..
+Restore-FileFromKeyVaultSecret -KeyVaultName $DeployKeyVaultName  -KeyVaultSecretName "footlocker-root-ca-cert" -RestoredFileDirectory "$KnifeDirectory/trusted_certs" -RestoredFileName "FL-Root-CA-exp2026-SHA2.crt"
+Restore-FileFromKeyVaultSecret -KeyVaultName $DeployKeyVaultName  -KeyVaultSecretName "footlocker-mlwsub-ca-cert" -RestoredFileDirectory "$KnifeDirectory/trusted_certs" -RestoredFileName "MLW-SubordinateCA-exp2021-SHA2.crt"
+Restore-FileFromKeyVaultSecret -KeyVaultName $DeployKeyVaultName  -KeyVaultSecretName "footlocker-wausub-ca-cert" -RestoredFileDirectory "$KnifeDirectory/trusted_certs" -RestoredFileName "WAU-SubordinateCA-exp2021-SHA2.crt"
+Restore-FileFromKeyVaultSecret -KeyVaultName $DeployKeyVaultName  -KeyVaultSecretName "footlocker-chwsub-ca-cert" -RestoredFileDirectory "$KnifeDirectory/trusted_certs" -RestoredFileName "CHW-SubordinateCA-exp2021-SHA2.crt"
+
+Get-ChildItem -path $JsonDirectory -filter *.chef.json | ForEach-Object {
+  $JsonFile = $_
+  Write-Host -ForegroundColor Yellow "`t* Processing $JsonFile"
+  If (Test-Path $JsonDirectory\$JsonFile) {
+    Try {
+      $server = Get-Content $JsonDirectory\$JsonFile | ConvertFrom-Json
+    }
+    Catch {
+      $RC = 2
+      Write-Host -ForegroundColor Red "`t*$(timestamp) Error Code $RC`: JSON Conversion Exception $($_.Exception.Message).  Terminating with error code $RC"
+      Write-Host -ForegroundColor Red "`t*$(timestamp) Exception: $($_.Exception.Message)"
+      $ExitCode = 2
+      $ErrorMessage = "$(timestamp) Error Code $RC`: JSON Conversion Exception $($_.Exception.Message).  Terminating with error code $RC"
+      ScriptEndError -Name $Name -ExitCode $ExitCode -ErrorMessage "$ErrorMessage"
+    }
+  }
+  Else {
+    $RC = 3
+    Write-Host -ForegroundColor Red "`t*$(timestamp) Error Code $RC`: file not found at $JsonFile. Exception $($_.Exception.Message).  Terminating with error code $RC"
+    Write-Host -ForegroundColor Red "`t*$(timestamp) Exception: $($_.Exception.Message)"
+    $ExitCode = 3
+    $ErrorMessage = "$(timestamp) Error Code $RC`: file not found at $JsonFile. Exception $($_.Exception.Message).  Terminating with error code $RC"
+    ScriptEndError -Name $Name -ExitCode $ExitCode -ErrorMessage "$ErrorMessage"
+  }
+  # Try to re-authenticate should our token have expired ..
+  try {
+    Confirm-Subscription -subscriptionName $subscriptionName -subscriptionID $subscriptionID
+  }
+  catch {
+    Write-Host -ForegroundColor Yellow "`tToken/Login seems to have expired";
+    if ( $SPNKeyVaultName ) {
+      Write-Host -ForegroundColor Yellow "`tLogging Out...";
+      Disconnect-AzureRmAccount
+      Write-Host -ForegroundColor Yellow "`tLogin using SPN";
+      #Confirm Connection to Azure, optionally setup proxy or login to Azure.
+      Set-AzureLogin -PROXY_USERNAME $PROXY_USERNAME -PROXY_USERNAME_SECRET $PROXY_USERNAME_SECRET `
+      -ProxyHostURI $ProxyHostURI -tenantid $tenantid -AZURE_SERVICE_PRINCIPAL $AZURE_SERVICE_PRINCIPAL `
+      -AZURE_SERVICE_PRINCIPAL_SECRET $AZURE_SERVICE_PRINCIPAL_SECRET -NoProxy:$NoProxy.IsPresent `
+      -UseStoredProxyCreds:$UseStoredProxyCreds.IsPresent -UseStoredAzureCreds:$UseStoredAzureCreds.IsPresent `
+      -NoAzureLogin:$NoAzureLogin.IsPresent
+      Write-Host -ForegroundColor Yellow "`tRefresh Deployment Credentials";
+      $DeploymentCredentials = Get-PSCredentialFromKeyVaultSecrets -KeyVaultName $SPNKeyVaultName -UserSecretName "$SPNKeyVaultSecretName-APPID" -PasswordSecretName "$SPNKeyVaultSecretName-PASSWD"
+      Write-Host -ForegroundColor Yellow "`tLogging Out...";
+      Disconnect-AzureRmAccount
+      Write-Host -ForegroundColor Yellow "`tLogging in... Using Deployment Credentials";
+      # Confirm Connection to Azure, optionally setup proxy or login to Azure.
+      Set-AzureLogin -PROXY_USERNAME $PROXY_USERNAME -PROXY_USERNAME_SECRET $PROXY_USERNAME_SECRET `
+        -ProxyHostURI $ProxyHostURI -tenantid $tenantid -NoProxy:$NoProxy.IsPresent `
+        -Credential $DeploymentCredentials
+    } else {
+      Set-AzureLogin -PROXY_USERNAME $PROXY_USERNAME -PROXY_USERNAME_SECRET $PROXY_USERNAME_SECRET `
+      -ProxyHostURI $ProxyHostURI -tenantid $tenantid -AZURE_SERVICE_PRINCIPAL $AZURE_SERVICE_PRINCIPAL `
+      -AZURE_SERVICE_PRINCIPAL_SECRET $AZURE_SERVICE_PRINCIPAL_SECRET -NoProxy:$NoProxy.IsPresent `
+      -UseStoredProxyCreds:$UseStoredProxyCreds.IsPresent -UseStoredAzureCreds:$UseStoredAzureCreds.IsPresent `
+      -NoAzureLogin:$NoAzureLogin.IsPresent
+    }
+    # Locate the correct subscription
+    Confirm-Subscription -subscriptionName $subscriptionName -subscriptionID $subscriptionID   
+  }
+
+  ####### Chef/Knife Variables #######
+  #$ChefCmd = "C:\Users\u190491\OneDrive\git-repo\AutomatedServerDeployments\DeploymentScriptsDev\supportfiles\EchoArgs.exe"
+  $ChefCmd = "knife"
+  $ChefCmdOptions = @()
+  $ChefCmdOptions += "bootstrap"
+  $OSFamily = $server.OSFamily.tolower()
+  If ($OSFamily -eq "windows") {
+    Write-Host -ForegroundColor Yellow "`t* OS Family is Windows"
+    $ChefCmdOptions += "windows winrm"
+  } else {
+    Write-Host -ForegroundColor Yellow "`t* OS Family is Linux"
+  }
+  # The IP Address of the node to BootStrap.
+  if ($server.ipAddress -eq "") {
+    Write-Host -ForegroundColor Yellow "`t* We have an empty IP address in json"
+    # Nested try/catch is a bit of a code smell, but this was the first thing I thought of :)
+    Write-Host -ForegroundColor Yellow "`t* Set NodeName to $($server.name.tolower()).$($server.domain.tolower())"
+    # Nodename JSON empty, use default value.
+    $NodeName = $server.name.tolower() + "." + $server.domain.tolower()
+    try {
+      Write-Host -ForegroundColor Yellow "`t* Use get-AzureRMVirtualMachineIPAddress -VMName $NodeName to lookup IPAddress"
+      $IPAddress = get-AzureRMVirtualMachineIPAddress -VMName $NodeName
+      write-Host -ForegroundColor Yellow "`t* We got $IPAddress"
+    }
+    catch {
+      Write-Host -ForegroundColor Red "`t*$(timestamp) Could not lookup IP address in Azure for FQDN - $NodeName"
+      Write-Host -ForegroundColor Red "`t*$(timestamp) Will try Short Name - $($server.name.tolower())"
+      $NodeName = $server.name.tolower()
+      try {
+        Write-Host -ForegroundColor Yellow "`t* Use get-AzureRMVirtualMachineIPAddress -VMName $NodeName to lookup IPAddress"
+        $IPAddress = get-AzureRMVirtualMachineIPAddress -VMName $NodeName
+        write-Host -ForegroundColor Yellow "`t* We got $IPAddress"
+      }
+      catch {
+        Write-Host -ForegroundColor Red "`t*$(timestamp) Error Code 4: Could not lookup IP address in Azure for $NodeName"
+        $ExitCode = 4
+        $ErrorMessage = "$(timestamp) Error Code 4: Could not lookup IP address in Azure for $NodeName.  Terminating with error code 4"
+        ScriptEndError -Name $Name -ExitCode $ExitCode -ErrorMessage "$ErrorMessage"
+      }
+    }
+  } else {
+    Write-Host -ForegroundColor Yellow "`t* Set IPAddress to $($server.ipAddress)"
+    $IPAddress = $server.ipAddress
+  }
+  $ChefCmdOptions += "$IPAddress"
+  # Are we using SSH to Bootstrap the node (linux yes, Windows no)
+  if ($server.bootstrapSSH) {
+    # We are using SSH
+    if ($server.bootstrapSSHUser -eq "") {
+      # SSH User JSON empty, use default value.
+      $SSHUser = Restore-TextFromKeyVaultSecret -KeyVaultName $DeployKeyVaultName  -KeyVaultSecretName $BootStrapUserSecretName
+    }
+    else {
+      # SSH User specified, use JSON value.
+      $SSHUser = $server.bootstrapSSHUser
+    }
+    if ($server.bootstrapSSHKeyFile -ne "") {
+      # SSH KeyFile specified, use JSON value.
+      $SSHPartTwo = "--identity-file " + $server.bootstrapSSHKeyFile
+    }
+    elseif ($server.bootstrapSSHPassword -ne "") {
+      # SSH Password specified, use JSON value.
+      $SSHPartTwo = "--ssh-password " + $server.bootstrapSSHPassword
+    }
+    else {
+      # SSHPassword JSON empty, use default value.
+      $SSHUserPassword = Restore-TextFromKeyVaultSecret -KeyVaultName $DeployKeyVaultName  -KeyVaultSecretName $BootStrapUserPasswordSecretName
+      $SSHPartTwo = "--ssh-password $SSHUserPassword"
+    }
+    $ChefCmdOptions += "--ssh-user $SSHUser"
+    $ChefCmdOptions += $SSHPartTwo
+    # Are we using Sudo?
+    if ($server.Usesudo) {
+      $ChefCmdOptions += "--sudo"
+      if ($server.SudoPassword -ne "") {
+        [string]$SudoPassword = $server.SudoPassword
+        $ChefCmdOptions += "--sudo-password " + $SudoPassword
+      }
+    }
+  } ### Working Here ###
+  elseif ($server.bootstrapSSHUser -eq "winrm") {
+    # Get Windows Username and Password stored locally on bamboo agent
+    $returnedCreds = Get-WindowsCreds
+    $winrmusername = $server.name + "\" + $returnedCreds[0]
+    $winrmpassword = $returnedCreds[1]
+    # $SSHUser = $winrmusername # "$($server.name)\administrator"
+    $ChefCmdOptions += "--winrm-user $winrmusername" # -x $SSHUser
+    $SSHPartTwo = "--winrm-password $winrmpassword" # -P
+    $ChefCmdOptions += $SSHPartTwo
+  }
+  # The NodeName in which to use in Chef, Default is FQDN.
+  if ($server.ChefNodeName -ne "") {
+    # Nodename specified, use JSON value.
+    $NodeName = $server.ChefNodeName
+  }
+  else {
+    # Nodename JSON empty, use default value.
+    $NodeName = $server.name.tolower() + "." + $server.domain.tolower()
+  }
+  $ChefCmdOptions += "--node-name $NodeName"
+  # The Chef Environment to set the node too..
+  if ($server.ChefEnvironment -ne "") {
+    # Chef Environment specified, use JSON value.
+    $ChefEnvironment = $server.ChefEnvironment
+  }
+  else {
+    # Chef Environment JSON empty, no default!
+    Write-Host -ForegroundColor Red "`t*$(timestamp) Error Code 4: No Chef Environment in JSON .  Terminating with error code 4"
+    $ExitCode = 4
+    $ErrorMessage = "$(timestamp) Error Code 4: No Chef Environment in JSON .  Terminating with error code 4"
+    ScriptEndError -Name $Name -ExitCode $ExitCode -ErrorMessage "$ErrorMessage"
+  }
+  $ChefCmdOptions += "--environment $ChefEnvironment"
+  # The Chef RunList to set the node too..
+  if ($server.ChefRunList -ne "") {
+    # Chef RunList specified, use JSON value.
+    $ChefRunList = $server.ChefRunList
+  }
+  else {
+    # Chef RunList JSON empty, Use Default.
+    Switch ($OSFamily) {
+      "windows" {
+        $ChefRunList = "role[fl_base_windows_corp]"
+      }
+      "linux" {
+        $ChefRunList = "role[fl_base_linux_corp]"
+      }
+    }
+  }
+  $ChefCmdOptions += "--run-list '$ChefRunList'"
+  
+  # The Secretfile to use with Encrypted Chef Encrypted Data Bags
+  if ($server.SecretFile -ne "") {
+    #SecretFile Specified in JSON
+    $SecretFile = $server.SecretFile
+  }
+  else {
+    $SecretFile = ".chef/encrypted_data_bag_secret.pem"
+  }
+  $ChefCmdOptions += "--secret-file $SecretFile"
+  # Custom JSON Attribute File
+  if ($server.UseJsonAttributeFile) {
+    if ($server.JsonAttributeFile -ne "") {
+      #Custom JSON File Specified in JSON
+      $JsonAttributeFile = $server.JsonAttributeFile
+    }
+    else {
+      Switch ($OSFamily) {
+        "windows" {
+          $JsonAttributeFile = "supportfiles\fl_base_windows_corp.json"
+        }
+        "linux" {
+          $JsonAttributeFile = "supportfiles\fl_base_linux_corp.json"
+        }
+      }
+    }
+    $ChefCmdOptions += "--json-attribute-file $JsonAttributeFile"
+  }
+  # Disable SSH Host Key Checking
+  $ChefCmdOptions += "--no-host-key-verify"
+  # Custom JSON Attribute File
+  if ($server.JsonAttributes -ne "") {
+    #Custom JSON File Specified in JSON
+    $JsonAttributes = $server.JsonAttributes
+    $ChefCmdOptions += "--json-attributes '$JsonAttributes'"
+  }
+  # Node Tags
+  if ($server.tags -ne "") {
+    #Custom JSON File Specified in JSON
+    $NodeTags = $server.tags
+    $ChefCmdOptions += "--tags '$NodeTags'"
+  }
+  # The Chef RunList to set the node too..
+  if ($server.bootstrapURL -ne "") {
+    # Chef RunList specified, use JSON value.
+    $bootstrapURL = $server.bootstrapURL
+    Switch ($OSFamily) {
+      "windows" {	$ChefCmdOptions += "--msi-url $bootstrapURL" }
+      "linux" {	$ChefCmdOptions += "--bootstrap-url $bootstrapURL" }
+    }
+  }
+  else {
+    # Chef Bootstrap URL empty, Use Default.
+    Switch ($OSFamily) {
+      "windows" {
+        $bootstrapURL = "http://mlwrms10.corp.footlocker.net/public/devops/Chef/chef-client-12.19.36-1-x64.msi"
+        $ChefCmdOptions += "--msi-url  $bootstrapURL -VV"
+      }
+      "linux" {
+        $bootstrapURL = "http://mlwrms10.corp.footlocker.net/public/devops/BootStrap/bootstrapvm.sh"
+        $ChefCmdOptions += "--bootstrap-url  $bootstrapURL"
+      }
+    }
+  }
+  #Proxy Info.
+  if ($server.UseProxy) {
+    if ($server.specifyProxyInfo) {
+      $bootstrapHttpProxy = $server.bootstrapHttpProxy
+      #$bootstrapHttpsProxy = $server.bootstrapHttpsProxy
+      $bootstrapNoProxy = $server.bootstrapNoProxy
+    }
+    else {
+      Get-ProxyCreds
+    }
+    $ChefCmdOptions += "--bootstrap-proxy $bootstrapHttpProxy"
+    $ChefCmdOptions += "--bootstrap-no-proxy $bootstrapNoProxy"
+  }
+
+  # Init chef shell
+  chef shell-init powershell | Invoke-Expression
+
+  # If this is a Cleanup Run, then Run Cleanup.
+  if ($RunDelete) {
+    Write-Host -ForegroundColor Yellow "`t*$(timestamp)...Script was called as a Delete Run"
+    $Name = "Chef Cleanup run of $NodeName"
+    RunDelete -Name $NodeName -NodeIP $IPAddress -SSHUserPassword $SSHUserPassword -SSHUser $SSHUser
+    return
+  }
+
+  Write-Host -ForegroundColor Yellow "`t*$(timestamp) Start Chef Bootstrap of $NodeName"
+
+  # Check to See if the node already exists in Chef, if it does and
+  # DeleteNodeifExists is $false, then just skip the bootstrap of the node
+  # If DeleteNodeifExists is $true, then delete the node/client from Chef.
+  $NodeExists = Confirm-ChefNodeIsBootStrapped -NodeName $NodeName
+  if ($NodeExists) {
+    if ($server.DeleteNodeifExists) {
+      # OKay we want to force a Boot Strap, so Delete the Node/Client
+      Write-Host -ForegroundColor Yellow "`t* $NodeName looks to already be bootstrapped into Chef"
+      Write-Host -ForegroundColor Yellow "`t* and the value of DeleteNodeifExists is $true so we will force"
+      Write-Host -ForegroundColor Yellow "`t* a bootstrap by deleting the old node/client"
+      Remove-ChefNode -NodeName $NodeName  -NodeIP $NodeIP -NodeAdministratorPassword $SSHUserPassword -NodeAdministrator $SSHUser
+    }
+    else {
+      Write-Host -ForegroundColor Yellow "`t* $NodeName looks to already be bootstrapped into Chef"
+      Write-Host -ForegroundColor Yellow "`t* and the value of DeleteNodeifExists is $false so we will not force"
+      Write-Host -ForegroundColor Yellow "`t* a bootstrap by deleting the old node/client"
+      return
+    }
+  }
+
+  # $ChefCmdOptions
+  #BootStrap!
+  Write-Host -ForegroundColor Yellow "`t* Start Bootstrap of $NodeName"
+  $p = Start-Process -FilePath $ChefCmd -ArgumentList $ChefCmdOptions -NoNewWindow -PassThru -wait
+  if ($p.exitcode -ne 0) {
+    Write-Host -ForegroundColor Yellow "`t*$ChefCmd failed with error $($p.exitcode)"
+    $NAME = "$NodeName"
+    $RC = 6
+    if ($server.DeleteAfterFailedBootstrap) {
+      CleanupFailure -Name $Name -NodeIP $IPAddress -SSHUserPassword $SSHUserPassword -SSHUser $SSHUser -ExitCode $RC -ErrorMessage "$LogFileContent"
+    }
+    $ExitCode = 6
+    $ErrorMessage = "$ChefCmd failed with error $($p.exitcode)"
+    ScriptEndError -Name $Name -ExitCode $ExitCode -ErrorMessage "$ErrorMessage"
+  }
+  else { Write-Host -ForegroundColor Green "`t* $lastexitcode "}
+  Write-Host -ForegroundColor Yellow "`t* $(timestamp) Chef BootStrap of $NodeName complete"
+  
+  #Node Runlist setup after bootstrap-CRD-347
+  
+  $UseNodeChefRunList = $false  
+  if($server.SetNodeRunListAfterBootstrap -ne "")
+  {
+  $UseNodeChefRunList = $server.SetNodeRunListAfterBootstrap
+  }
+  
+  if($useNodechefRunList)
+  { 
+	if($server.NodeRunListAfterBootstrap -ne "") 
+		{  
+		# Chef RunList specified, use JSON value.
+		$NodeChefRunListAfterBootstrap = $server.NodeRunListAfterBootstrap
+		}
+	else {
+		if($server.SetNodeRunListFailureIsBootstrapFailure -eq $true)
+			{
+			Write-Host -ForegroundColor Yellow "`t* NodeRunListAfterBootstrap is null and SetNodeRunListFailureIsBootstrapFailure is $true, failing the Bootstrap"
+			$NAME = "$NodeName"
+			$RC = 6
+			if ($server.DeleteAfterFailedBootstrap) {
+			CleanupFailure -Name $Name -NodeIP $IPAddress -SSHUserPassword $SSHUserPassword -SSHUser $SSHUser -ExitCode $RC -ErrorMessage "$LogFileContent"
+			}
+			$ExitCode = 6
+			$ErrorMessage = "NodeRunListAfterBootstrap is null and SetNodeRunListFailureIsBootstrapFailure is $true, failing the Bootstrap"
+			ScriptEndError -Name $Name -ExitCode $ExitCode -ErrorMessage "$ErrorMessage"
+			}
+		else {
+		      Write-Host -ForegroundColor Yellow "`t* NodeRunListAfterBootstrap is null and SetNodeRunListFailureIsBootstrapFailure is $false, Proceeding Bootstrap using $ChefRunList"
+			  $NodeChefRunListAfterBootstrap = $ChefRunList
+			}
+	
+		}
+  }
+   
+  $SetChefRunList = Set-ChefNodeRunList -NodeName $NodeName -RunList $NodeChefRunListAfterBootstrap
+  if($SetChefRunList -eq $false)
+   {
+	if($server.SetNodeRunListFailureIsBootstrapFailure -eq $true)
+   {
+		Write-Host -ForegroundColor Yellow "`t* NodeRunListAfterBootstrap is null and SetNodeRunListFailureIsBootstrapFailure is $true, failing the Bootstrap"
+			$NAME = "$NodeName"
+			$RC = 6
+			if ($server.DeleteAfterFailedBootstrap) {
+			CleanupFailure -Name $Name -NodeIP $IPAddress -SSHUserPassword $SSHUserPassword -SSHUser $SSHUser -ExitCode $RC -ErrorMessage "$LogFileContent"
+			}
+			$ExitCode = 6
+			$ErrorMessage = "NodeRunListAfterBootstrap is null and SetNodeRunListFailureIsBootstrapFailure is $true, failing the Bootstrap"
+			ScriptEndError -Name $Name -ExitCode $ExitCode -ErrorMessage "$ErrorMessage"
+  }
+  else {
+     Write-Host -ForegroundColor Yellow "`t* Node RunList failed and SetNodeRunListFailureIsBootstrapFailure is $false, Proceeding the Bootstrap."
+  }
+  }
+  
+  #end CRD-347
+  
+}
+####### Standard Script End Boilerplate #######
+Write-Host -ForegroundColor Yellow "`t* $(timestamp) Deployment of $Name complete"
+MarkScriptEnd

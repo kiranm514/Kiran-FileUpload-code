@@ -1,0 +1,42 @@
+﻿@model Kiran.FileUpload.Models.Home.FilesViewModel
+
+<h2>List of Files</h2>
+
+<table>
+    <tr>
+        <th>File Name</th>
+        <th></th>
+        <th>File URI</th>
+        <th></th>
+        <th></th>
+    </tr>
+    @foreach (var item in Model.Files)
+    {
+        if (!(item.Name == "expiration.json"))
+        {
+<tr>
+    <td>
+        <a asp-action="Download"
+           asp-route-filename="@item.Name">
+            @item.Name
+        </a>
+    </td>
+    <td></td>
+    <td>
+        <a asp-action="Download"
+           asp-route-filename="@item.Name">
+            @Url.Action("download", "Home", null, "http")?filename=@item.Name
+        </a>
+    </td>
+    <td></td>
+    <td>
+        
+        <form asp-controller="Home" asp-action="DeleteFile" method="post" asp-route-filename="@item.Name"
+              enctype="multipart/form-data">
+            <button type="submit">Delete Files</button>
+        </form>  
+    </td>
+</tr>
+        }
+    }
+</table>

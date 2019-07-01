@@ -1,0 +1,42 @@
+﻿<form asp-controller="Home" asp-action="UploadFile" method="post"
+      enctype="multipart/form-data">
+    <table>
+        <tr>
+            <th></th>
+            <th></th>
+        </tr>
+        <tr>
+            <td>
+                File :
+            </td>
+            <td>
+                <input type="file" name="file" />
+            </td>
+        </tr>
+        <tr>
+            <td>
+                FileName:
+            </td>
+            <td>
+                <input type="text" name="filename" />
+            </td>
+        </tr>
+        <tr>
+            <td>
+                Expiration:
+            </td>
+            <td>
+                <input type="date" value='"<%= SomeFieldDate.ToString("yyyy-MM-dd")%>"' name="expirationdate"/>
+                
+            </td>
+    </table>
+    <button type="submit">Upload File</button>
+
+</form>
+<form asp-controller="Home" asp-action="DownloadLink" method="post"
+      enctype="multipart/form-data">
+    <button type="submit">Download Files</button>
+</form>
+
+
+

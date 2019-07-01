@@ -1,0 +1,13 @@
+This Service is built using ASP.Net Core 2.0
+
+Run Docker-Compose file in project root directory to Build the project and publish the artifacts to a working directory and then create an images using those build artifacts.
+
+Use "Docker-Compose build" to build the project and then create the image.
+
+Use "Docker-Compose up" to start the containers.
+
+API is exposed using port 5000, port numbers are specified in Docker-Compose file. Ports can be changed to meet any requirements. 
+
+File are not persisted in this project. But we can persist them by mounting the network drives/shares to container from dockerfile. 
+
+File expiration dates are stored into expiration.JSON file, And if the file with same name is uploaded second time expiration date will update too. 
